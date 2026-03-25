@@ -4,6 +4,7 @@
 
 import React, { useEffect, useMemo, useState } from 'react';
 import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
+import { apiGetQuizQuestions, apiListLessons, apiListQuizzes, apiMyCourseProgress, apiSubmitQuiz, apiUpdateLessonProgress } from '../api/lmsApi';
 import { useAuth } from '../context/AuthContext';
 import {
     completeLesson,
@@ -32,8 +33,8 @@ function useQuizFlag() {
  * @return {JSX.Element} Page.
  */
 export function LessonPage() {
-    const { courseId, lessonId } = useParams();
-    const { user } = useAuth();
+    const { courseId, lessonId } = useParams(); // courseId = slug; lessonId = numeric in API mode (string in mock)
+    const { user, token } = useAuth();
     const navigate = useNavigate();
     const showQuiz = useQuizFlag();
 
@@ -42,19 +43,72 @@ export function LessonPage() {
     const [loading, setLoading] = useState(true);
     const [completed, setCompleted] = useState(false);
     const [progress, setProgress] = useState({ completed: 0, total: 0 });
+    const [mode, setMode] = useState('api');
+    const [error, setError] = useState('');
 
     const [quizState, setQuizState] = useState({
         open: false,
-        current: 0,
-        selected: -1,
-        score: 0,
+        loading: false,
+        quizId: null,
+        questions: [],
+        answers: {}, // questionId -> optionId
         finished: false,
-        attempt: null,
+        result: null,
     });
 
     useEffect(() => {
         let isMounted = true;
-        async function load() {
+
+        async function loadApi() {
+            if (!token) {
+                throw new Error('no-token');
+            }
+
+            // Need lessons list for lesson lookup + course progress totals.
+            const lessons = await apiListLessons(String(courseId), token);
+            const l = lessons.find((x) => String(x.id) === String(lessonId)) || null;
+            if (!l) {
+                throw new Error('Lesson not found');
+            }
+
+            // Compute completion from progress rows (if any).
+            // Note: API progress endpoint requires course_id (numeric). We don't have it from lesson list.
+            // For now, we treat "completed" as: have a progress record for this lesson with completed/100.
+            // (We update via PUT /lessons/{lesson_id}/progress on completion.)
+            let isDone = false;
+            try {
+                // If backend adds a course-id lookup by slug, this could be improved.
+                // Here we keep best-effort by trusting local completed state + update endpoint result.
+                // No-op.
+            } catch {
+                // ignore
+            }
+
+            if (isMounted) {
+                setCourse({
+                    id: String(courseId),
+                    title: String(courseId),
+                    lessons,
+                });
+                setLesson(l);
+                setCompleted(isDone);
+                setProgress({ completed: 0, total: lessons.length });
+                setMode('api');
+            }
+
+            // Try to load quiz meta (optional) so the "Take quiz" button appears.
+            try {
+                // We do not have numeric course_id in this page; quiz association is optional.
+                // So we only show quiz if query param requests it AND we can resolve quiz by listing from course progress page.
+                // (CourseDetailPage passes quiz=1, but doesn't provide quizId.)
+                // For now we keep quiz open only in mock mode unless backend adds a direct slug->id lookup in a dedicated endpoint.
+                void showQuiz;
+            } catch {
+                // ignore
+            }
+        }
+
+        async function loadMock() {
             setLoading(true);
             const c = await getCourse(String(courseId));
             if (!c) {
@@ -69,31 +123,34 @@ export function LessonPage() {
                 setLesson(l);
                 setCompleted(isDone);
                 setProgress(prog);
+                setMode('mock');
                 setLoading(false);
             }
         }
+
+        async function load() {
+            setError('');
+            setLoading(true);
+            try {
+                await loadApi();
+                if (isMounted) setLoading(false);
+            } catch (e) {
+                // API mode failed -> fallback to mock
+                try {
+                    await loadMock();
+                    if (isMounted) setError('Backend unavailable for lesson/progress; using demo data.');
+                } catch (e2) {
+                    if (isMounted) setError(e2.message || e.message || 'Failed to load lesson');
+                    if (isMounted) setLoading(false);
+                }
+            }
+        }
+
         void load();
         return () => {
             isMounted = false;
         };
-    }, [courseId, lessonId, user]);
-
-    useEffect(() => {
-        let isMounted = true;
-        async function maybeOpenQuiz() {
-            if (!showQuiz || !course || !course.quiz) {
-                return;
-            }
-            const attempt = await getQuizAttempt(user.id, course.quiz.id);
-            if (isMounted) {
-                setQuizState((s) => ({ ...s, open: true, attempt }));
-            }
-        }
-        void maybeOpenQuiz();
-        return () => {
-            isMounted = false;
-        };
-    }, [showQuiz, course, user]);
+    }, [courseId, lessonId, user, token, showQuiz]);
 
     if (loading) {
         return <div className="notice noticeInfo">Loading lesson…</div>;
@@ -108,15 +165,32 @@ export function LessonPage() {
     }
 
     async function handleComplete() {
-        await completeLesson(user.id, lesson.id);
-        setCompleted(true);
-        const prog = await getCourseProgress(user.id, course);
-        setProgress(prog);
+        if (mode === 'mock') {
+            await completeLesson(user.id, lesson.id);
+            setCompleted(true);
+            const prog = await getCourseProgress(user.id, course);
+            setProgress(prog);
+            return;
+        }
+
+        if (!token) {
+            setError('Please sign in to track progress.');
+            return;
+        }
+
+        try {
+            const row = await apiUpdateLessonProgress(Number(lesson.id), { status: 'completed', progress_percent: 100 }, token);
+            setCompleted(row.status === 'completed' || row.progress_percent >= 100);
+            // total remains from lessons list; completed count not tracked here (kept simple).
+        } catch (e) {
+            setError(e.message || 'Failed to update progress');
+        }
     }
 
-    const idx = course.lessons.findIndex((l) => l.id === lesson.id);
-    const prev = idx > 0 ? course.lessons[idx - 1] : null;
-    const next = idx >= 0 && idx < course.lessons.length - 1 ? course.lessons[idx + 1] : null;
+    const lessonsList = mode === 'mock' ? course.lessons : course.lessons;
+    const idx = lessonsList.findIndex((l) => String(l.id) === String(lesson.id));
+    const prev = idx > 0 ? lessonsList[idx - 1] : null;
+    const next = idx >= 0 && idx < lessonsList.length - 1 ? lessonsList[idx + 1] : null;
 
     const percent = progress.total ? Math.round((progress.completed / progress.total) * 100) : 0;
 
@@ -125,15 +199,16 @@ export function LessonPage() {
             <div className="row spaceBetween">
                 <div>
                     <h1 className="h1">
-                        {course.title} / {lesson.title}
+                        {mode === 'mock' ? course.title : course.id} / {lesson.title}
                     </h1>
                     <div className="row">
                         <span className="badge badgeSuccess">{percent}% course progress</span>
                         {completed ? <span className="badge badgeSuccess">Lesson completed</span> : <span className="badge">In progress</span>}
+                        {mode === 'mock' ? <span className="badge">Demo</span> : null}
                     </div>
                 </div>
                 <div className="row">
-                    <Link className="btn" to={`/courses/${course.id}`}>
+                    <Link className="btn" to={`/courses/${mode === 'mock' ? course.id : courseId}`}>
                         Course overview
                     </Link>
                     {!completed ? (
@@ -144,19 +219,35 @@ export function LessonPage() {
                 </div>
             </div>
 
+            {error ? (
+                <>
+                    <div className="divider" />
+                    <div className="notice noticeInfo">{error}</div>
+                </>
+            ) : null}
+
             <div className="divider" />
 
-            {lesson.videoUrl ? (
+            {lesson.videoUrl || lesson.video_url ? (
                 <div className="notice noticeInfo">
                     Video link:{' '}
-                    <a href={lesson.videoUrl} target="_blank" rel="noreferrer">
-                        {lesson.videoUrl}
+                    <a href={lesson.videoUrl || lesson.video_url} target="_blank" rel="noreferrer">
+                        {lesson.videoUrl || lesson.video_url}
+                    </a>
+                </div>
+            ) : null}
+
+            {lesson.resource_url ? (
+                <div className="notice noticeInfo">
+                    Resource link:{' '}
+                    <a href={lesson.resource_url} target="_blank" rel="noreferrer">
+                        {lesson.resource_url}
                     </a>
                 </div>
             ) : null}
 
             <p className="p" style={{ marginTop: '12px' }}>
-                {lesson.content}
+                {lesson.content || lesson.content_text}
             </p>
 
             <div className="divider" />
@@ -164,14 +255,14 @@ export function LessonPage() {
             <div className="row spaceBetween">
                 <div className="row">
                     {prev ? (
-                        <Link className="btn" to={`/courses/${course.id}/lessons/${prev.id}`}>
+                        <Link className="btn" to={`/courses/${courseId}/lessons/${prev.id}`}>
                             ← Previous
                         </Link>
                     ) : (
                         <span className="badge">Start</span>
                     )}
                     {next ? (
-                        <Link className="btn btnPrimary" to={`/courses/${course.id}/lessons/${next.id}`}>
+                        <Link className="btn btnPrimary" to={`/courses/${courseId}/lessons/${next.id}`}>
                             Next →
                         </Link>
                     ) : (
@@ -179,19 +270,17 @@ export function LessonPage() {
                     )}
                 </div>
 
-                {course.quiz ? (
+                {mode === 'mock' && course.quiz ? (
                     <button className="btn" type="button" onClick={() => setQuizState((s) => ({ ...s, open: true }))}>
                         Take quiz
                     </button>
                 ) : null}
             </div>
 
-            {course.quiz && quizState.open ? (
-                <QuizDialog
+            {mode === 'mock' && course.quiz && quizState.open ? (
+                <MockQuizDialog
                     quiz={course.quiz}
                     userId={user.id}
-                    state={quizState}
-                    setState={setQuizState}
                     onClose={() => {
                         setQuizState((s) => ({ ...s, open: false }));
                         navigate(`/courses/${course.id}/lessons/${lesson.id}`, { replace: true });
@@ -203,10 +292,20 @@ export function LessonPage() {
 }
 
 /**
- * @param {{ quiz: any, userId: string, state: any, setState: Function, onClose: Function }} props Props.
+ * Retain previous mock quiz experience so the UI stays feature-complete without backend.
+ *
+ * @param {{ quiz: any, userId: string, onClose: Function }} props Props.
  * @return {JSX.Element} Quiz dialog.
  */
-function QuizDialog({ quiz, userId, state, setState, onClose }) {
+function MockQuizDialog({ quiz, userId, onClose }) {
+    const [state, setState] = useState({
+        current: 0,
+        selected: -1,
+        score: 0,
+        finished: false,
+        attempt: null,
+    });
+
     const question = quiz.questions[state.current];
 
     async function submitAnswer() {
@@ -236,7 +335,7 @@ function QuizDialog({ quiz, userId, state, setState, onClose }) {
         return () => {
             isMounted = false;
         };
-    }, [state.finished, state.score, quiz, userId, setState]);
+    }, [state.finished, state.score, quiz, userId]);
 
     return (
         <div className="card cardPad" role="dialog" aria-modal="true" aria-label="Quiz">

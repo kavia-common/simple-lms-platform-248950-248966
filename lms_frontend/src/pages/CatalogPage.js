@@ -4,7 +4,25 @@
 
 import React, { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { listCourses } from '../data/mockData';
+import { apiListCourses } from '../api/lmsApi';
+import { useAuth } from '../context/AuthContext';
+import { listCourses as listCoursesMock } from '../data/mockData';
+
+/**
+ * Map backend CourseOut -> UI course shape used by pages.
+ *
+ * @param {any} c Backend course.
+ * @return {{ id: string, title: string, description: string, instructorName: string, backendId?: number }} UI course.
+ */
+function toUiCourse(c) {
+    return {
+        id: String(c.slug),
+        backendId: Number(c.id),
+        title: c.title,
+        description: c.description || '',
+        instructorName: 'Instructor', // backend currently doesn't expose instructor name
+    };
+}
 
 /**
  * PUBLIC_INTERFACE
@@ -13,23 +31,37 @@ import { listCourses } from '../data/mockData';
  * @return {JSX.Element} Page.
  */
 export function CatalogPage() {
+    const { token } = useAuth();
     const [courses, setCourses] = useState([]);
     const [query, setQuery] = useState('');
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState('');
+    const [dataSource, setDataSource] = useState('api'); // api|mock
 
     useEffect(() => {
         let isMounted = true;
         async function load() {
+            setError('');
+            setIsLoading(true);
             try {
-                setIsLoading(true);
-                const data = await listCourses();
+                const apiCourses = await apiListCourses(token || null);
                 if (isMounted) {
-                    setCourses(data);
+                    setCourses(apiCourses.map(toUiCourse));
+                    setDataSource('api');
                 }
             } catch (e) {
-                if (isMounted) {
-                    setError(e.message || 'Failed to load catalog');
+                // Fallback to mock data so the UI is still usable without backend running.
+                try {
+                    const mock = await listCoursesMock();
+                    if (isMounted) {
+                        setCourses(mock);
+                        setDataSource('mock');
+                        setError('Backend unavailable; showing demo data.');
+                    }
+                } catch (e2) {
+                    if (isMounted) {
+                        setError(e2.message || e.message || 'Failed to load catalog');
+                    }
                 }
             } finally {
                 if (isMounted) {
@@ -41,7 +73,7 @@ export function CatalogPage() {
         return () => {
             isMounted = false;
         };
-    }, []);
+    }, [token]);
 
     const filtered = useMemo(() => {
         const q = query.trim().toLowerCase();
@@ -62,8 +94,8 @@ export function CatalogPage() {
                 <div>
                     <h1 className="h1">Course Catalog</h1>
                     <p className="p">
-                        Browse courses, enroll, track progress, and continue lessons. Use the demo role switcher in the header to
-                        preview instructor/admin views.
+                        Browse courses, enroll, track progress, and continue lessons.
+                        {dataSource === 'mock' ? ' (Demo data mode)' : ''}
                     </p>
                 </div>
 
@@ -81,7 +113,7 @@ export function CatalogPage() {
                 </div>
             </div>
 
-            {error ? <div className="notice noticeDanger">{error}</div> : null}
+            {error ? <div className="notice noticeInfo">{error}</div> : null}
             {isLoading ? <div className="notice noticeInfo">Loading courses…</div> : null}
 
             <div className="divider" />
